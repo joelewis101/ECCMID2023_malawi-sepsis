@@ -1,0 +1,941 @@
+library(survival)
+library(blantyreSepsis)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(forcats)
+library(purrr)
+library(kableExtra)
+library(ggplotify)
+library(UpSetR)
+library(eulerr)
+library(patchwork)
+library(survminer)
+library(wBoot)
+library(viridis)
+library(brms)
+library(pheatmap)
+library(factoextra)
+library(mice)
+library(bayesplot)
+library(splines)
+library(here)
+
+
+
+# transform
+
+BTparticipants %>%
+  select(
+    ustand,
+    calc_age,
+    ptsex,
+    hivstatus,
+    cd4_absolute,
+    haemoglobin,
+    screentemp,
+    t0sbp,
+    t0dbp,
+    t0hr,
+    t0rr,
+    t0spo2,
+    gcs,
+    lactate,
+    wcc,
+    platelets,
+    sodium,
+    co2,
+    creatinine,
+    urea
+  ) %>%
+  mutate(
+    male = if_else(ptsex == "Male", 1, 0),
+    hiv_reactive = case_when(
+      hivstatus == "Reactive" ~ 1,
+      hivstatus == "Non reactive" ~ 0,
+      TRUE ~ NA_real_
+    ),
+    gcs.low = as.numeric(gcs < 15)
+  ) %>%
+  select(-c(ptsex, hivstatus, gcs))  ->
+  df.mod.trans
+df.mod.trans[df.mod.trans== 999] <- NA
+
+
+
+df.mod.trans %>%
+  mutate(
+    calc_age_log = log(calc_age),
+    cd4_absolute_log = log(cd4_absolute),
+    creatinine_log = log(creatinine),
+    lactate_log = log(lactate),
+    plt_log = log(platelets),
+    t0spo2_log = log(101 - t0spo2),
+    t0sbp_log = log(t0sbp),
+    t0dbp_log = log(t0dbp),
+    urea_log = log(urea),
+    screentemp_log = log(41 - screentemp),
+    wcc_log = log(wcc),
+    sodium_log = log(sodium),
+    t0rr_log = log(t0rr)
+  ) -> df.mod.trans
+
+df.mod.trans %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(value)) +
+  geom_density() +
+  facet_wrap( ~ name, scales = "free")
+
+# drop unused vars
+
+df.mod.trans %>%
+  select(
+    -c(
+      cd4_absolute,
+      creatinine,
+      lactate,
+      platelets,
+      t0spo2,
+      t0sbp,
+      t0dbp,
+      t0rr_log,
+      screentemp,
+      urea,
+      t0dbp,
+      sodium,
+      wcc,
+      calc_age
+    )
+  ) -> df.mod.trans
+
+
+# rename and drop diastolic blood pressure and urea
+# because strongly correlated with systolic blood pressure and creatinine
+
+df.mod.trans %>%
+  dplyr::rename(
+    Age = calc_age_log,
+    CD4 = cd4_absolute_log,
+    Lactate = lactate_log,
+    Cr = creatinine_log,
+    Plt = plt_log,
+    SpO2 = t0spo2_log,
+    SBP = t0sbp_log,
+    Temp = screentemp_log,
+    WCC = wcc_log,
+    RR = t0rr,
+    Hb = haemoglobin,
+    `HIV+` = hiv_reactive,
+    HR = t0hr,
+    Male = male,
+    `GCS<15` = gcs.low,
+    Na = sodium_log,
+    `HCO3-` = co2,
+    CantStand = ustand
+  ) %>%
+  select(-c(t0dbp_log,
+            urea_log)) ->
+  df.mod.trans
+
+
+
+### Perform PCA
+
+
+
+# do PCA
+
+# first prepare full df with all necessary covariates for modelling
+
+# Prepare data frame with all metaadata --------------------------------
+# remember df.mod.trans is all the transformed covariates for PCA
+# BTdata_combined is all data
+
+
+BTparticipants %>%
+  select(-c(
+    d90_death,
+    d180_death,
+    t,
+    died,
+    art_time,
+    hivcpt,
+    ever_tb,
+    tbongoing
+  )) %>%
+  left_join(
+    BTtreatment %>%
+      transmute(
+        pid = pid,
+        tb.rx = !is.na(timeto_antitb),
+        fung.rx = !is.na(timeto_antifungal),
+        mal.rx = !is.na(timeto_antimalarial),
+        time_to_abx = timeto_ab,
+        fluid.6hr = iv_fluid_6hr
+      )
+  ) %>%
+  left_join(
+    select(
+      BTaetiology,
+      pid,
+      malaria,
+      dengue,
+      chik,
+      arbovirus,
+      inv.bacterial,
+      inv.fungal,
+      tb
+    ) %>%
+      mutate(across(!contains("pid"), ~ if_else(is.na(
+        .x
+      ), 0, .x)))
+  ) %>%
+  mutate(
+    ustand = as.character(ustand),
+    malaria = as.character(malaria),
+    dengue = as.character(dengue),
+    chik = as.character(chik),
+    inv.bacterial = as.character(inv.bacterial),
+    inv.fungal = as.character(inv.fungal),
+    tb = as.character(tb),
+    tb.rx = as.character(as.numeric(tb.rx)),
+    fung.rx = as.character(as.numeric(fung.rx)),
+    mal.rx = as.character(as.numeric(mal.rx)),
+    time_to_abx = as.numeric(time_to_abx),
+    abx = as.character(as.numeric(!is.na(time_to_abx))),
+    fluid.6hr = fluid.6hr / 1000,
+    d28_death = as.character(d28_death),
+    ptsex = recode(ptsex,
+                   "Male" = "1",
+                   "Female" = "0"),
+    hivstatus = recode(
+      hivstatus,
+      "Reactive" = "1",
+      "Non reactive" = "0",
+      .default = NA_character_
+    ),
+  ) %>%
+  mutate(
+    no_diagnosis = 1,
+    no_diagnosis = case_when(
+      malaria == 1 ~ 0,
+      dengue == 1 ~ 0,
+      chik == 1 ~ 0,
+      inv.bacterial == 1 ~ 0,
+      inv.fungal == 1 ~ 0,
+      tb == 1 ~ 0,
+      TRUE ~ no_diagnosis
+    ),
+    no_diagnosis = as.character(no_diagnosis),
+    tb = if_else(is.na(tb), "0", tb),
+    malaria = if_else(is.na(malaria), "0", malaria),
+    dengue = if_else(is.na(dengue), "0", dengue),
+    chik = if_else(is.na(chik), "0", chik),
+    inv.bacterial = if_else(is.na(inv.bacterial), "0", inv.bacterial),
+    inv.fungal = if_else(is.na(inv.fungal), "0", inv.fungal)
+  ) ->
+  BTdata_combined
+
+# do PCA -----------------------------------------------------------------
+# on df,mod.trans
+
+prcomp(df.mod.trans[complete.cases(df.mod.trans),],
+       scale = TRUE) -> p
+
+p.scores <- as.data.frame(p$scores)
+
+# add in metadata: 28 day death  
+  
+bind_cols(
+  BTdata_combined[complete.cases(df.mod.trans),] %>% 
+    select(d28_death),
+  as.data.frame(p$x)
+) -> p.out
+
+
+
+
+
+
+
+priors <- c(
+  prior(student_t(3, 0, 2.5), class = "Intercept"),
+  prior(student_t(3, 0, 2.5), class = "b")
+)
+
+brm(
+  formula = d28_death ~ PC1 +
+    PC2  +
+    PC3,
+  data = p.out, prior = priors,
+  family = bernoulli(link = "logit"), save_all_pars = TRUE
+)-> b.mod3
+
+
+
+
+### Impute missing data
+
+```{r impute-missing-data}
+# Scale fluid and time to abx --------------------------------------------
+
+fluid.mean <- mean(BTdata_combined$fluid.6hr, na.rm = TRUE)
+fluid.sd <- sd(BTdata_combined$fluid.6hr, na.rm = TRUE)
+BTdata_combined$fluid.6hr <- (BTdata_combined$fluid.6hr - 
+                                fluid.mean)/fluid.sd
+tta.mean <- mean(BTdata_combined$time_to_abx, na.rm = TRUE)
+tta.sd <- sd(BTdata_combined$time_to_abx, na.rm = TRUE)
+BTdata_combined$time_to_abx <- (BTdata_combined$time_to_abx- 
+                                  tta.mean)/tta.sd
+
+# Prepare datafrane for imputation
+
+bind_cols(
+  df.mod.trans,
+  BTdata_combined %>% 
+    select(
+      d28_death,
+      pid,
+      tb.rx,
+      fung.rx,
+      mal.rx,
+      malaria, 
+      arbovirus, 
+      inv.bacterial, 
+      inv.fungal, 
+      tb,
+      time_to_abx,
+      fluid.6hr)) %>% 
+  mutate(
+    CantStand = as.character(CantStand),
+    `HIV+` = as.factor(`HIV+`),
+    `GCS<15` = as.factor(`GCS<15`),
+    d28_death = as.factor(d28_death),
+    tb = as.numeric(tb),
+    tb = if_else(is.na(tb), 0, tb),
+    malaria = as.numeric(malaria),
+    malaria = if_else(is.na(malaria), 0, malaria),
+    arbovirus = as.numeric(arbovirus),
+    arbovirus = if_else(is.na(arbovirus), 0, arbovirus),
+    inv.bacterial = as.numeric(inv.bacterial),
+    inv.bacterial = if_else(is.na(inv.bacterial), 0, inv.bacterial),
+    inv.fungal = as.numeric(inv.fungal),
+    inv.fungal = if_else(is.na(inv.fungal), 0, inv.fungal),
+  ) %>%
+  dplyr::rename(
+    HIV_pos = `HIV+`,
+    GCS_less15 = `GCS<15`,
+    HCO3 = `HCO3-`
+  ) %>% 
+  as.data.frame() ->
+  df.mod.trans.scale.plus.metadata
+
+# make pred matrix ----------------------------------------------------------
+
+# predict everything from everything else
+
+mice(df.mod.trans.scale.plus.metadata, maxit = 0) -> ini
+pm <- ini$predictorMatrix
+ini$method -> meth
+pm[, (ncol(df.mod.trans) + 2):ncol(df.mod.trans.scale.plus.metadata)] <- 0
+pm[(ncol(df.mod.trans) + 2):ncol(df.mod.trans.scale.plus.metadata),] <- 0
+meth[(ncol(df.mod.trans) + 2):ncol(df.mod.trans.scale.plus.metadata)] <- ""
+df.mod.trans.scale.plus.metadata$time_to_abx <- as.numeric(
+  df.mod.trans.scale.plus.metadata$time_to_abx
+)
+
+# impute missing data --------------------------------------------------------
+
+m <- 10 # number of datasets
+mice(df.mod.trans.scale.plus.metadata, m = m, predictorMatrix = pm,
+     method = meth) -> df.mod.imp
+complete(df.mod.imp, action = "all") -> datasets.imp
+
+### Scale imputed data and project onto PCA coordinates
+
+
+# get variables to correct type -----------------------------------------------
+
+lapply(datasets.imp,
+       function(x)
+         x %>% mutate(
+           CantStand = as.numeric(CantStand),
+           HIV_pos = as.numeric(HIV_pos),
+           GCS_less15 = as.numeric(GCS_less15),
+           d28_death = as.numeric(d28_death),
+           d28_death = d28_death - 1,
+           tb = as.factor(tb),
+           tb.rx = as.factor(tb.rx),
+           malaria = as.factor(malaria),
+           inv.fungal = as.factor(inv.fungal)
+         ) %>%
+         as.data.frame) -> datasets.imp
+
+# project onto pca coords ----------------------------------------------------
+
+lapply(datasets.imp,
+       function(x)
+         bind_cols(
+           x,
+           as.data.frame(
+             scale(x[,1:ncol(df.mod.trans)],
+                 p$center, p$scale) %*% p$rotation) 
+         )) -> datasets.imp
+
+# add the mice .imp and .id vars back in -------------------------------------
+
+for (i in 1:m) {
+    datasets.imp[[i]]$.imp <- i
+    datasets.imp[[i]]$.id <- 1:nrow(datasets.imp[[i]])
+  }
+
+
+### Fit models for antimicrobial therapy
+
+# fit univariable and then multivariable models -------------------------------
+
+# tb ----------------------------------------------------------------------
+
+# univrariable - diagnosis
+
+brm_multiple(
+  formula = d28_death ~
+    tb,
+  prior = priors,
+  data = datasets.imp,
+  family = bernoulli(link = "logit"),
+  save_all_pars = TRUE
+) -> b.m.tb.unadj
+#write_rds(b.m.tb.unadj, "models/b.m.tb.unadj.RDS")
+
+# univrariable - treatment
+
+brm_multiple(
+  formula = d28_death ~
+    tb.rx,
+  prior = priors,
+  data = datasets.imp,
+  family = bernoulli(link = "logit"),
+  save_all_pars = TRUE
+) -> b.m.tb.rx.unadj
+#write_rds(b.m.tb.rx.unadj, "models/b.m.tb.rx.unadj.RDS")
+
+# multivariable
+
+brm_multiple(
+  formula = d28_death ~ PC1 +
+    PC2  +
+    PC3 +
+    tb + tb.rx,
+  prior = priors,
+  data = datasets.imp,
+  family = bernoulli(link = "logit"),
+  save_all_pars = TRUE
+) -> b.m.tb
+#write_rds(b.m.tb, "models/b.m.tb.final.RDS")
+
+
+#mcmc_intervals_data(b.m.tb, regex_pars = "^b_", 
+#transformations = exp, prob_outer = 0.95)
+
+# malaria --------------------------------------------------------------------
+
+# multivariable 
+
+brm_multiple(
+  formula = d28_death ~ PC1 +
+    PC2  +
+    PC3 +
+    malaria + mal.rx,
+  prior = priors,
+  data = datasets.imp,
+  family = bernoulli(link = "logit"),
+  save_all_pars = TRUE
+) -> b.m.mal
+#write_rds(b.m.mal, "models/b.m.mal.final.RDS")
+
+# univariable - diagnosis
+
+brm_multiple(
+  formula = d28_death ~
+    malaria,
+  prior = priors,
+  data = datasets.imp,
+  family = bernoulli(link = "logit"),
+  save_all_pars = TRUE
+) -> b.m.mal.univ
+#write_rds(b.m.mal.univ, "models/b.m.mal.univ.RDS")
+
+# univariable - treatment
+
+brm_multiple(
+  formula = d28_death ~
+    mal.rx,
+  prior = priors,
+  data = datasets.imp,
+  family = bernoulli(link = "logit"),
+  save_all_pars = TRUE
+) -> b.m.mal.rx.univ
+#write_rds(b.m.mal.rx.univ, "models/b.m.mal.rx.univ.RDS")
+#mcmc_intervals_data(b.m.mal, regex_pars = "^b_",
+#transformations = exp, prob_outer = 0.95)
+
+# invasive fungal ----------------------------------------------------------
+
+# multivariable
+
+brm_multiple(
+  formula = d28_death ~ PC1 +
+    PC2  +
+    PC3 +
+    inv.fungal + fung.rx,
+  prior = priors,
+  data = datasets.imp,
+  family = bernoulli(link = "logit"),
+  save_all_pars = TRUE
+) -> b.m.fung
+#write_rds(b.m.fung, "models/b.m.fung.final.RDS")
+
+# diagnosis
+
+brm_multiple(
+  formula = d28_death ~
+    inv.fungal,
+  prior = priors,
+  data = datasets.imp,
+  family = bernoulli(link = "logit"),
+  save_all_pars = TRUE
+) -> b.m.fung.univ
+#write_rds(b.m.fung.univ, "models/b.m.fung.univ.RDS")
+
+brm_multiple(
+  formula = d28_death ~ fung.rx,
+  prior = priors,
+  data = datasets.imp,
+  family = bernoulli(link = "logit"),
+  save_all_pars = TRUE
+) -> b.m.fung.rx.univ
+#write_rds(b.m.fung.rx.univ, "models/b.m.fung.rx.univ.RDS")
+
+# make output df -----------------------------------------------------------
+
+bind_rows(
+  mcmc_intervals_data(
+    b.mod3,
+    regex_pars = "^b_",
+    transformations = exp,
+    prob_outer = 0.95
+  ) %>%
+    filter(str_detect(parameter, "_PC")) %>%
+    mutate(type = "unadjusted",
+           adj = "unadjusted"),
+  mcmc_intervals_data(
+    b.m.tb.unadj,
+    regex_pars = "^b_",
+    transformations = exp,
+    prob_outer = 0.95
+  ) %>%
+    filter(str_detect(parameter, "tb")) %>%
+    mutate(type = "unadjusted",
+           adj = "unadjusted"),
+  mcmc_intervals_data(
+    b.m.tb.rx.unadj,
+    regex_pars = "^b_",
+    transformations = exp,
+    prob_outer = 0.95
+  ) %>%
+    filter(str_detect(parameter, "tb")) %>%
+    mutate(type = "unadjusted",
+           adj = "unadjusted"),
+  mcmc_intervals_data(
+    b.m.tb,
+    regex_pars = "^b_",
+    transformations = exp,
+    prob_outer = 0.95
+  ) %>%
+    filter(str_detect(parameter, "tb") |
+             str_detect(parameter, "_PC")) %>%
+    mutate(type = "tb.model",
+           adj = "adjusted"),
+  mcmc_intervals_data(
+    b.m.mal.univ,
+    regex_pars = "^b_",
+    transformations = exp,
+    prob_outer = 0.95
+  ) %>%
+    filter(str_detect(parameter, "mal")) %>%
+    mutate(type = "unadjusted",
+           adj = "unadjusted"),
+  mcmc_intervals_data(
+    b.m.mal.rx.univ,
+    regex_pars = "^b_",
+    transformations = exp,
+    prob_outer = 0.95
+  ) %>%
+    filter(str_detect(parameter, "mal")) %>%
+    mutate(type = "unadjusted",
+           adj = "unadjusted"),
+  mcmc_intervals_data(
+    b.m.mal,
+    regex_pars = "^b_",
+    transformations = exp,
+    prob_outer = 0.95
+  ) %>%
+    filter(str_detect(parameter, "mal") |
+             str_detect(parameter, "_PC")) %>%
+    mutate(type = "mal.model",
+           adj = "adjusted"),
+  mcmc_intervals_data(
+    b.m.fung.univ,
+    regex_pars = "^b_",
+    transformations = exp,
+    prob_outer = 0.95
+  ) %>%
+    filter(str_detect(parameter, "fung")) %>%
+    mutate(type = "unadjusted",
+           adj = "unadjusted"),
+  mcmc_intervals_data(
+    b.m.fung.rx.univ,
+    regex_pars = "^b_",
+    transformations = exp,
+    prob_outer = 0.95
+  ) %>%
+    filter(str_detect(parameter, "fung")) %>%
+    mutate(type = "unadjusted",
+           adj = "unadjusted"),
+  mcmc_intervals_data(
+    b.m.fung,
+    regex_pars = "^b_",
+    transformations = exp,
+    prob_outer = 0.95
+  ) %>%
+    filter(str_detect(parameter, "fung") |
+             str_detect(parameter, "_PC")) %>%
+    mutate(type = "fung.model",
+           adj = "adjusted")  
+) -> df.plot
+
+```
+
+```{r plot-model-outputs, fig.cap = "Unadjusted and adjusted odds ratios for death for antimicrobial treatments.", fig.height = 5, fig.width= 5 }
+
+# Plot effects of antimicrobial treatments
+
+df.plot %>% 
+  filter(!(str_detect(parameter, "_PC") & adj == "adjusted")) %>% 
+  filter((str_detect(parameter, "rx1") | str_detect(parameter, "PC"))) %>% 
+  mutate(parameter =
+           case_when(
+             str_detect(parameter, "fung.rx") ~ "Antifungal",
+             str_detect(parameter, "mal.rx") ~ "Antimalarial",
+             str_detect(parameter, "tb.rx") ~ "Antimtubercular",
+             TRUE ~ str_replace(parameter, "t\\(b_", "")
+           )) %>% 
+  mutate(parameter = str_replace(parameter, "\\)", "")
+  ) %>% 
+  ggplot(aes(parameter, 
+             m, 
+             ymin = ll, 
+             ymax = hh, 
+             color = fct_rev(adj),
+             shape = fct_rev(adj))) + 
+  geom_point(position = position_dodge(width = 0.4)) + 
+  geom_errorbar(width = 0,position = position_dodge(width = 0.4)) + 
+  theme_bw() +
+  geom_hline(aes(yintercept = 1), linetype = "dashed") +
+  labs(y = "OR", x = "Antimicrobial")  +
+  theme(legend.position = "top", 
+        legend.title = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_color_manual(values = c(
+                                viridis(6, option = "C")[4],
+                                "black")) +
+  scale_shape_manual(values = c(4, 16))-> p.effects
+
+p.effects
+
+
+### Fit models for time-to-antibacterials and vlume of IV fluid
+
+# models for time to antibacterials (linear and restricted cubic spline) ------
+# and IV fluid (linear and restricted cubic spline) ------------------
+
+# time to abx ----------------------------------------------------------
+
+# linear time to abx univariable
+
+brm_multiple(
+  formula = d28_death ~   time_to_abx,
+  prior = priors,
+  data = datasets.imp,
+  family = bernoulli(link = "logit"),
+  save_all_pars = TRUE
+) -> b.m.tta.lin.univ
+
+#write_rds(b.m.tta.lin.univ, "models/b.m.tta.lin.univ.RDS")
+#exp(mcmc_intervals_data(b.m.tta.lin.univ,  regex_pars = "^b",
+#                        prob_outer = 0.95)[5:9]/tta.sd)
+
+# linear time to abx corrected for severity/host
+
+brm_multiple(
+  formula = d28_death ~ PC1 +
+    PC2  +
+    PC3 +
+    time_to_abx,
+  prior = priors,
+  data = datasets.imp,
+  family = bernoulli(link = "logit"),
+  save_all_pars = TRUE
+) -> b.m.tta.lin
+#write_rds(b.m.tta.lin, "models/b.m.tta.lin.RDS")
+#exp(mcmc_intervals_data(b.m.tta.lin,  regex_pars = "^b",
+#                    prob_outer = 0.95)[5,5:9]/tta.sd)
+
+
+
+# restricted cubic spline time to abx
+# calculate quantiles for knots
+k <- quantile(datasets.imp[[1]]$time_to_abx,
+              c(0.1, 0.5, 0.9),
+              na.rm = TRUE)
+
+# fit
+brm_multiple(
+  formula = d28_death ~ PC1 +
+    PC2  +
+    PC3 +
+    ns(time_to_abx,
+       knots = c(-0.599, -0.418, 1.028)),
+  prior = priors,
+  data = datasets.imp,
+  family = bernoulli(link = "logit"),
+  save_all_pars = TRUE
+) -> b.m.tta.nonlin
+#write_rds(b.m.tta.nonlin, "models/b.m.tta.nonlin.RDS")
+
+# IV fluid ---------------------------------------------------------- 
+# restricted cubic spine, corrected for severity/host
+
+# get knot locations
+k <- quantile(datasets.imp[[1]]$fluid.6hr,
+              c(0.1, 0.5, 0.9),
+              na.rm = TRUE)
+
+# fit
+
+brm_multiple(
+  formula = d28_death ~ PC1 +
+    PC2  +
+    PC3 + ns(fluid.6hr, knots = c(-1.564, -0.009, 1.410)),
+  prior = priors,
+  data = datasets.imp,
+  family = bernoulli(link = "logit"),
+  save_all_pars = TRUE
+) -> b.m.fluid
+#write_rds(b.m.fluid, "models/b.m.fluid.RDS")
+
+# linear corrected for severity/host
+
+brm_multiple(
+  formula = d28_death ~ PC1 +
+    PC2  +
+    PC3 + fluid.6hr,
+  prior = priors,
+  data = datasets.imp,
+  family = bernoulli(link = "logit"),
+  save_all_pars = TRUE
+) -> b.m.fluid.lin
+
+# univariable 
+
+brm_multiple(
+  formula = d28_death ~ fluid.6hr,
+  prior = priors,
+  data = datasets.imp,
+  family = bernoulli(link = "logit"),
+  save_all_pars = TRUE  
+) -> b.m.fluid.lin.univ
+
+#write_rds(b.m.fluid.lin, "models/b.m.fluid.lin.RDS")
+#write_rds(b.m.fluid.lin.univ, "models/b.m.fluid.lin.univ.RDS")
+#exp(mcmc_intervals_data(b.m.fluid.lin.univ,  regex_pars = "^b",
+#                        prob_outer = 0.95)[5:9]*1000/fluid.sd)
+#exp(mcmc_intervals_data(b.m.fluid.lin,  regex_pars = "^b",
+#                        prob_outer = 0.95)[5,5:9]*1000/fluid.sd)
+
+# plot marginal effects -----------------------------------------------------
+
+conditional_effects(b.m.tta.nonlin, effects = "time_to_abx") -> tta.ce
+
+tta.ce$time_to_abx %>% 
+  ggplot(aes((time_to_abx + tta.mean/tta.sd)*tta.sd, 
+             estimate__, ymin = lower__, ymax = upper__)) + 
+  geom_line() + 
+  geom_ribbon(alpha = 0.3, fill = viridis(6, option = "C")[4])  + 
+  coord_cartesian(ylim = c(0,0.3), xlim = c(0,50)) + 
+  theme_bw() + labs(x = "Time (hrs) to antibacterial", 
+                    y = "28-day mortality") -> p.tta
+
+conditional_effects(b.m.fluid, effects = "fluid.6hr") -> fluid.ce
+
+fluid.ce$fluid.6hr %>% 
+  ggplot(aes((fluid.6hr + fluid.mean/fluid.sd)*(fluid.sd), 
+             estimate__, ymin = lower__, ymax = upper__)) + geom_line() + 
+  geom_ribbon(alpha = 0.3, fill = viridis(6, option = "C")[4])  + 
+  coord_cartesian(ylim = c(0,0.3)) + 
+  theme_bw() + 
+  labs(x = "Fluid (L) over 6hr", y = "28-day mortality") -> p.fluid
+
+
+(p.fluid | p.tta ) + plot_annotation(tag_levels = "A")
+
+
+
+### Final parameter estimate table
+
+# Make table of model outputs
+bind_rows(
+  df.plot,
+  mcmc_intervals_data(
+    b.m.tta.lin.univ,
+    regex_pars = "^b_",
+    prob_outer = 0.95
+  ) %>%
+    dplyr::mutate(across(
+      starts_with(c("l", "m", "h")),
+      ~ case_when(parameter == "b_time_to_abx" ~
+                    exp(.x / tta.sd),
+                  TRUE ~ exp(.x))
+    )) %>%
+    filter(str_detect(parameter, "abx") |
+             str_detect(parameter, "_PC")) %>%
+    mutate(type = "unadjusted",
+           adj = "unadjusted"),
+  mcmc_intervals_data(b.m.tta.lin,
+                      regex_pars = "^b_",
+                      prob_outer = 0.95) %>%
+    dplyr::mutate(across(
+      starts_with(c("l", "m", "h")),
+      ~ case_when(parameter == "b_time_to_abx" ~
+                    exp(.x / tta.sd),
+                  TRUE ~ exp(.x))
+    )) %>%
+    filter(str_detect(parameter, "abx") |
+             str_detect(parameter, "_PC")) %>%
+    mutate(type = "tta.model",
+           adj = "adjusted"),
+  mcmc_intervals_data(
+    b.m.fluid.lin.univ,
+    regex_pars = "^b_",
+    prob_outer = 0.95
+  ) %>%
+    dplyr::mutate(across(
+      starts_with(c("l", "m", "h")),
+      ~ case_when(parameter == "b_fluid.6hr" ~
+                    exp(.x / fluid.sd),
+                  TRUE ~ exp(.x))
+    )) %>%
+    filter(str_detect(parameter, "fluid") |
+             str_detect(parameter, "_PC")) %>%
+    dplyr::mutate(type = "unadjusted",
+                  adj = "unadjusted"),
+  mcmc_intervals_data(b.m.fluid.lin,
+                      regex_pars = "^b_",
+                      prob_outer = 0.95) %>%
+    dplyr::mutate(across(
+      starts_with(c("l", "m", "h")),
+      ~ case_when(parameter == "b_fluid.6hr" ~
+                    exp(.x / fluid.sd),
+                  TRUE ~ exp(.x))
+    )) %>%
+    filter(str_detect(parameter, "fluid") |
+             str_detect(parameter, "_PC")) %>%
+    mutate(type = "fluid.model",
+           adj = "adjusted")
+) ->
+  df.plot
+
+
+df.plot %>%
+  mutate(parm_string = paste0(sp_dc(m, 2), " (", sp_dc(ll, 2),
+                              "-", sp_dc(hh, 2), ")")) %>%
+  mutate(parameter = str_replace(parameter, "t\\(b_|b_", "")) %>%
+  mutate(
+    parameter = str_replace(parameter, "\\)", "")
+    ) %>% 
+  select(parameter, parm_string, type, adj) %>%
+  pivot_wider(
+    id_cols = parameter,
+    names_from = c(type, adj),
+    values_from = parm_string
+  ) -> mod.output.tab
+
+
+mod.output.tab %>% 
+  dplyr::mutate(
+    parameter = dplyr::recode(
+      parameter,
+      tb1 = "Diagnosis is TB",
+      tb.rx1 = "Received TB treatment",
+      malaria1 = "Diagnosis is malaria",
+      mal.rx1 = "Received malaria treatment",
+      inv.fungal1 =
+        "Diagnosis is invasive fungal disease",
+      fung.rx1 = "Recieved antifungal",
+      time_to_abx = "Time to antibacterial therapy (per hour)",
+      fluid.6hr = "Vol of IV fluid (L)"
+    )
+  ) %>%
+  dplyr::rename(
+    "Unadjusted" = "unadjusted_unadjusted",
+    "TB treatment" = "tb.model_adjusted",
+    "Malaria treatment" = "mal.model_adjusted",
+    "Fungal treatment" = "fung.model_adjusted",
+    "Time to antibacterial" = "tta.model_adjusted",
+    "Vol of IV fluid" = "fluid.model_adjusted"
+  ) %>%
+  dplyr::mutate(
+    dplyr::across(
+      dplyr::everything(),
+      ~ if_else(is.na(.x), "-", .x)
+      )
+    ) -> mod.output.tab
+
+kbl(mod.output.tab,
+    row.names = F, caption = "SUPPLEMENTARY TABLE 8: Parameter estimates from models assessing effect of therapies on mortality, expressed as adjusted odds ratios with a point estimate (posterior median) and 95% credible intervals.") %>%
+  kable_classic(full_width = FALSE)
+
+#write_csv(mod.output.tab, "tables/SUP_mort_models_table.csv")
+
+### Final publication plot
+
+
+# (1,2) PCA var plot and final mort plot  ------------------------------------
+
+
+(p.effects | p.tta | p.fluid) + 
+  plot_annotation(tag_levels = "A") 
+
+mort.model.plot.final
+if (write_figs) {
+  
+ggsave( here("figures/MAIN_F3_mort_model.plot.pdf"),
+        mort.model.plot.final, 
+        width = 8, height = 8, units = "in")
+ggsave( here("figures/MAIN_F3_mort_model.plot.tiff"),
+        mort.model.plot.final, 
+        width = 8, height = 8, units = "in",
+        dpi = 600)
+}
+```
+
+
+
+### Reproducability
+
+```{r sessioninfo}
+
+sessionInfo()
+
+```

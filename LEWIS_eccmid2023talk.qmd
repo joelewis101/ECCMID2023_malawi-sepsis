@@ -1,0 +1,482 @@
+---
+title: Linking sepsis aetiology, antimicrobial use, and antimicrobial resistance in Malawi to inform pragmatic sepsis trials in sub-Saharan Africa
+author:
+  - Joseph M. Lewis\inst{1,2,3}
+institute: 
+  - \inst{1}University of Liverpool, Liverpool, UK 
+  - \inst{2}Liverpool School of Tropical Medicine, Liverpool, UK
+  - \inst{3}Malawi Liverpool Wellcome Research Programme, Blantyre, Malawi
+date: 2023-04-16
+date-format: long
+format: 
+  beamer:
+    theme: Copenhagen
+    aspectratio: 169
+---
+
+## Background: Sepsis in sub-Saharan Africa
+
+:::: {.columns align=center}
+
+::: {.column width="33%"}
+
+```{r}
+#| echo: false
+#| fig.width: 5
+#| fig.height: 4
+#| out.width: 90%
+#| fig.align: center
+
+
+library(tidyverse)
+library(hrbrthemes)
+library(blantyreESBL)
+library(blantyreSepsis)
+library(kableExtra)
+library(viridis)
+library(bayesplot)
+library(glue)
+
+
+inv <- function(x) {
+  return(1/x)
+}
+log2scale <- function(x) {
+  return(log(2) * x)
+}
+color_scheme_set(scheme = "gray")
+
+
+specify_decimal <- function(x, k) trimws(format(round(x, k), nsmall = k))
+
+extrafont::loadfonts(quiet = TRUE)
+
+data.frame(aet = c("","","",""),
+           aetiology = factor(c("Malaria", "BSI", "TB", "Unknown"),
+                              levels = c("TB","BSI", "Malaria", "Unknown")),
+           prevalence = c(0.10,0.17,0.24, 0.49)) |>
+ggplot(aes(aet, prevalence, fill = fct_rev(aetiology))) +
+geom_col() + 
+coord_flip() +
+labs(title = expression("Pooled cause of sepsis"),
+     subtitle = "Sub-Saharan Africa",
+     caption = "SOURCE: Lewis et al 2019\nCrit Care 11;23(1)\n10.1186/s13054-019-2501-y",
+x = "",
+y = "Prevalence",
+fill = "") +
+theme_minimal() +
+theme(legend.position = "bottom", 
+      text = element_text(family = "sans", 
+                          face = "italic",
+                          size = 16),
+      plot.caption = element_text(color = "grey")) +
+scale_fill_ipsum() +
+guides(fill = guide_legend(reverse= TRUE))
+
+```
+
+
+- Sepsis is caused by a diverse range of pathogens
+
+:::
+
+::: {.column width="33%"}
+  
+  
+  
+![](ECCMID_presentation_images/FEAST_paper.png)
+  
+- Optimum treatments are unknown
+
+:::
+
+::: {.column width="34%"}
+
+```{r}
+#| echo: false
+#| fig.width: 5
+#| fig.height: 5
+#| out.width: 90%
+#| fig.align: center
+
+musicha <- read_csv("musicha_kleb_3grR.csv",
+  col_names = c("Year", "Percentage")
+)
+
+musicha |>
+  ggplot(aes(Year, Percentage)) +
+  geom_line(linewidth = 4, color = ipsum_pal()(1)) +
+  theme_minimal() + 
+  scale_color_ipsum() +
+  labs(title= expression('3GC resistance,'~italic("K. pneumoniae")~''),
+  subtitle = "Blantyre, Malawi",
+  caption = "SOURCE: Musicha et al 2017\nLancet ID 17;10") +
+theme(legend.position = "bottom", 
+      text = element_text(family = "sans", 
+                          face = "italic",
+                          size = 16),
+      plot.caption = element_text(color = "grey")) 
+
+
+
+```
+
+- Antimicrobial resistance is an increasing threat to treatment
+
+:::
+
+::::
+
+## Talk outline: Modelling to inform pragmatic sepsis trials
+
+- Methods: the DASSIM study (**D**eveloping an **A**ntimicrobial **S**trategy for
+  **S**epsis **I**n **M**alawi)
+- Sepsis aetiology in Queen Elizabeth Central Hospital, Blantyre, Malawi
+- Modelling determinants of sepsis outcome
+- Colonisation with extended-spectrum beta-lactamase producing
+  Enterobacterales (ESBL-E) in sepsis survivors
+- Modelling determinants of ESBL-E colonisation
+- Bringing aetiology and AMR together to inform putative interventions
+
+## Methods: The DASSIM study
+
+:::: {.columns align=center}
+
+::: {.column width="50%"}
+
+```{mermaid}
+%%| fig-width: 2.5
+flowchart TD
+    A[225\nSepsis\npatients*\nAge 16+] -->|Expanded\ndiagnostics***|B[Selective\nESBL-E\nstool culture\nD0, 7, 28, 90, 180]
+    C[100\nInpatient\ncontrols**] -->B
+    D[100\nComunity\ncontrols**] -->B
+
+```
+
+:::
+
+::: {.column width="50%"}
+
+\* Defined by fever plus one of GCS < 15, SBP < 90mmHg, SpO2 <90%, RR > 30  
+\*\* Age/sex matched, no antimicrobial exposure 4 weeks  
+\*\*\* Blood culture, mycobacterial blood culture, urinary
+LAM, sputum Xpert, acute and convalescent sera for dengue, chikungunya,
+leptospira, spotted fever group and epidemic typhus group rickettsioses. 
+
+:::
+
+::::
+
+## Sepsis aetiology
+
+
+:::: {.columns align=center}
+
+::: {.column width="50%"}
+
+```{r}
+
+
+BTparticipants %>% 
+  mutate(
+    gcs_lessthan_15 = if_else(gcs < 15, true =  "yes", false = "no"),
+  ) %>% 
+  select(
+    calc_age,
+    ptsex,
+    hivstatus,
+    cd4_absolute, 
+    hivonart,  
+#    art_time, 
+#    hivcpt,
+#    ever_tb, 
+#    tbongoing,
+    screentemp,
+    t0hr,
+    t0rr,
+    t0sbp, 
+#    t0dbp, 
+    t0spo2, 
+    gcs_lessthan_15, 
+    ustand,
+    days_unwell,
+ #   haemoglobin,
+ #   platelets, 
+ #   wcc, 
+ #   sodium,
+ #   potassium, 
+ #   co2, 
+ #   creatinine, 
+    lactate
+    ) %>% 
+  do(pretty_tbl_df(.,vars_to_char = c("ustand"),
+                   vars_to_specify_rounding = c(
+                     "screentemp" = 1,
+                     "haemoglobin" = 1,
+                     "potassium" = 1,
+                     "lactate" = 1),
+                   confint = FALSE)) %>%
+  filter(!levels %in% c("Non reactive",
+                        "No",
+                        "no",
+                        "0",
+                        "Female")) %>%
+  mutate(levels = case_when(
+    variable == "calc_age" ~ "Age (years)",
+    variable == "ptsex" ~ "Male sex n/N (%)",
+    variable == "hivstatus" ~ "Living with HIV, n/N (%)",
+    variable == "hivonart" ~ "Receiving ART, n/N (%)",
+    variable == "cd4_absolute" ~ "CD4 count (cells/microL)",
+    variable == "art_time" ~ 
+      "Time on antiretroviral therapy (months)",
+    variable == "hivcpt" ~ 
+      "Receiving co-trimoxazole preventative therapy, n/N (%)",
+    variable == "ever_tb" ~ "History of receiving TB treatment n/N (%)",
+    variable == "tbongoing" ~ 
+      "Of those, currently receiving TB treatment n/N (%)",
+    variable == "screentemp" ~ "Temperature (C)",
+    variable == "t0hr" ~ "Heart rate (beats/min)",
+    variable == "t0rr" ~ "Respiratory rate (breaths/min)",
+    variable == "t0sbp" ~ "Systolic blood pressure (mmHg)", 
+    variable == "t0dbp" ~ "Diastolic blood pressure (mmHg)", 
+    variable == "t0spo2" ~ "Oxygen saturation (%)",
+    variable == "gcs_lessthan_15" ~ "Glasgow coma score < 15 n/N (%)",
+    variable ==  "ustand" ~ "Unable to stand unaided n/N (%)",
+    variable ==  "days_unwell" ~ 
+      "Length of time unwell for (days)", 
+    variable ==  "haemoglobin" ~ "Haemoglobin (g/dL)",
+    variable ==  "platelets" ~ "platelets (10^9^/l)",
+    variable ==  "wcc" ~ "White cell count (10^9^/l)",
+    variable ==  "sodium" ~ "Sodium (mmol/L)", 
+    variable ==  "potassium" ~ "Potassium (mmol/L)", 
+    variable ==  "co2" ~ "Bicarbonate (mmol/L)", 
+    variable ==  "creatinine" ~ "Creatinine (mmol/L)", 
+    variable ==  "lactate" ~ "Lactate (mmol/L)", 
+    TRUE ~ levels),    
+    variable = case_when(
+      variable %in% c("calc_age",
+                      "ptsex") ~ "Demographics",
+      variable %in% c("hivstatus",
+                      "cd4_absolute",
+                      "hivonart",
+                      "art_time",
+                      "hivcpt",
+                      "ever_tb",
+                      "tbongoing") ~ "HIV/TB status",
+      str_detect(variable, "t0") | 
+        variable %in% c("screentemp",
+                        "gcs_lessthan_15",
+                        "ustand",
+                        "days_unwell") ~ "Physiology",
+      variable %in% c("haemoglobin",
+                      "platelets",
+                      "wcc",
+                      "sodium",
+                      "potassium",
+                      "co2",
+                      "creatinine",
+                      "lactate") ~ "Laboratory parameters"
+    )
+  ) -> t1
+
+t1 %>%
+  select(-variable) %>%
+  kbl(col.names = c("Variable", "Value"),
+      format = 'latex',
+      booktabs = TRUE,
+   caption = "Baseline characteristics") %>%
+  kable_styling(full_width = FALSE, font_size = 6) %>%
+  #pack_rows(index = make_kable_rowgroup_string(t1, variable)) %>% 
+  footnote(general  = c("Median (IQR) unless stated", 
+                        "ART = Antiretroviral therapy"))
+
+```
+
+:::
+
+
+::: {.column width="50%"}
+
+![34% of the cohort diagnosed with tuberculosis](ECCMID_presentation_images/SUP_F6_euler_dx.pdf)
+
+
+:::
+
+::::
+
+## TB treatment is associated with survival
+
+
+![Modelled determinants of sepsis mortality using Bayesian logistic
+regression; aOR of death with TB treatment vs no treatment 0.17 (95% CrI 0.05-0.49)](mort_model.plot.pdf){width=80%}
+
+## ESBL carriage in sepsis survivors
+
+![ESBL prevalence in sepsis survivors and matched
+controls; 83% of participants with confirmed aetiology received
+ceftriaxone - it would be expected to be active in 24%](esbl_prev_plot.pdf){width=60%}
+
+## Antimicrobial exposure drives ESBL-E carriage
+
+:::: {.columns align=center}
+
+::: {.column width="50%"}
+
+```{r}
+
+mcmc_intervals_data(
+  btESBL_model2posterior,
+  pars = c(
+    "alphas[1]",
+    "betas[1]",
+    "alphas[2]",
+    "betas[2]",
+    "gammas[1]",
+    "lambda",
+    "mu"
+  ),
+  transformations = list(
+    "alphas[1]" = exp,
+    "betas[1]" = exp,
+    "alphas[2]" = exp,
+    "betas[2]" = exp,
+    "gammas[1]" = log2scale,
+    "lambda" = inv,
+    "mu" = inv
+  ),
+  prob_outer = 0.95
+) %>% 
+  select(parameter, ll,m,hh) %>% 
+  mutate(stri = glue('{specify_decimal(m,2)} ({specify_decimal(ll,2)}-{specify_decimal(hh,2)})'),
+         parameter2 = case_when(
+           grepl("alpha", parameter)  ~"Hazard ratio ESBL-E Loss",
+           grepl("beta", parameter)  ~"Hazard ratio ESBL-E Gain",
+           grepl("gamma", parameter)  ~"Half life of effect (days)",
+           grepl("lambda", parameter)  ~"Colonised (days)",
+           grepl("mu", parameter)  ~"Uncolonised (days)",
+  ),
+  parameter = factor(parameter, levels = c("t(alphas[1])",
+                                           "t(betas[1])",
+                                           "t(gammas[1])",
+                                           "t(alphas[2])",
+                                           "t(betas[2])",
+                                           "t(lambda)",
+                                           "t(mu)"))) %>% 
+  arrange(parameter) %>% 
+  select(parameter2, stri) %>% 
+kbl( 
+  col.names = c("Variable", "Value"),
+  booktabs = TRUE,
+      format = 'latex',
+  caption = "Parameter estimates (95\\% CrI) from multistate model") %>% 
+  kable_styling(full_width = FALSE, font_size = 6) %>%
+  pack_rows("Effect of Antibacterials", 1,3) %>%
+  pack_rows("Effect of Hospitalisation", 4,5) %>%
+  pack_rows("Mean time in state", 6,7)
+
+```
+
+:::
+
+::: {.column width="50%"}
+
+
+```{r}
+#| echo: false
+#| fig.height: 3
+#| fig.width: 4
+#| fig.cap: Simulating different antimicrobial exposures from the multistate model
+#| fig.align: center
+
+
+fills = c("#A25050","#6497b1","#7cb9b9")
+cols = c("#8F2727","#03396c","#278f8f")
+
+btESBL_model2simulations %>%
+  mutate(abx_days = as.factor(abx_days)) %>% 
+    group_by(time, abx_days) %>%
+    summarise(
+        median = median(pr_esbl_pos),
+        lq = quantile(pr_esbl_pos, 0.025)[[1]],
+        uq = quantile(pr_esbl_pos, 0.975)[[1]]
+    ) %>%
+    mutate(abx_stop = paste0(as.character(abx_days), 
+                             " days \nantimicrobials")) %>%
+    ggplot(aes(
+        time,
+        median,
+        ymin = lq,
+        ymax = uq,
+        linetype = fct_rev(abx_stop),
+        fill = fct_rev(abx_stop),
+        color = fct_rev(abx_stop))
+    ) +
+    geom_line() + geom_ribbon(alpha = 0.4, color = NA) +
+    theme_bw() +
+  theme(legend.position = "top") +
+  scale_color_manual(values = c(cols[1], cols[1], cols[2])) +
+  scale_fill_manual(values = c(fills[1], fills[1], fills[2])) +
+  scale_linetype_manual(values = c("solid", "dashed", "solid")) +
+  labs(#linetype = "Antimicrobial exposure",
+       #color = "Antimicrobial exposure",
+       #fill = "Antimicrobial exposure",
+       y = "Simulated ESBL prevalence",
+       x = "Days post enrollment") +
+  coord_cartesian(ylim = c(0.1,0.9)) +
+  theme(legend.title = element_blank()) 
+
+```
+
+:::
+
+::::
+
+
+## Conclusions
+
+- Sepsis in Blantyre is caused by a variety of pathogens, which differ from
+  high-income settings
+- HIV-associated TB dominates
+- TB therapy was associated with survival
+- High prevalence of ESBL-E colonisation, driven by
+  antibacterial exposure 
+- Truncating courses of antibacterials may have a limited effect on ESBL carriage
+
+
+## The future ... ?
+
+- Pragmatic trials in sepsis/severe febrile illness in sSA
+  - Role of empiric antitubercular chemotherapy?
+  - Role of rapid diagnostic tests?
+  - Supportive care: fluids, pressors, oxygen?
+- AMR endpoints in clinical trials of sepsis
+  - What to measure?
+  - When?
+
+## Acknowledgements
+
+* Study participants
+- Funder: Wellcome Trust
+* In Liverpool and Malawi: Nick Feasey, Melita Gordon, Jamie Rylance,
+  Madlitso Mphasa, Lucy Keyala, Rachel Banda, Emma Smith, Jane Mallewa, Grace
+  Katha, Eva Heinz,Brian Faragher, Adam Roberts, Stephen Gordon, Tusekile
+  Phiri, Grace Mwaminawa, Witness Mtambo, Gladys Namacha, and Monica Matola,
+  Brigitte Denis, Lumbani Makhaza and Clemens Masesa
+- Wellcome Sanger Institue: Nick Thomson, Mat Beale 
+- Rare and Imported Pathogens Lab, UK Health Security Agency: Tim Brooks,
+  Jackie Duggan, Matthew Catton, Jennifer Small, Kate Withycombe and Supriya
+  Gurung
+
+## References
+
+*A Longitudinal, Observational Study of Etiology and Long-Term Outcomes of
+Sepsis in Malawi Revealing the Key Role of Disseminated Tuberculosis.* Lewis
+et al. Clinical Infectious Diseases 74 1840–1849 (2022).
+https://doi.org/10.1093/cid/ciab710
+
+*Colonization dynamics of extended-spectrum beta-lactamase-producing
+Enterobacterales in the gut of Malawian adults.* Lewis et al. Nature
+Microbiology 7, 1593–1604 (2022). https://doi.org/10.1038/s41564-022-01216-7
+
+Slides and code at
+[https://github.com/joelewis101](https://github.com/joelewis101)
